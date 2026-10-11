@@ -1,0 +1,189 @@
+name: seal-build
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Go package patterns to test (empty = full suite ./...)"
+        required: false
+        default: ""
+permissions:
+  contents: read
+env:
+  GO111MODULE: "on"
+  GOPROXY: "https://proxy.golang.org,direct"
+  MODULE_PATH: golang.org/x/tools
+  MODULE_VERSION: v0.0.0-20210106214847-113979e3529a
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.14"
+      - name: Regenerate godoc/static/static.go
+        run: |
+          set -euxo pipefail
+          # upstream's own //go:generate makestatic; a no-op on the pristine
+          # tree, but required so a later jquery.js replacement is reflected
+          # in static.go.
+          go generate ./godoc/static
+          git status --short
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Build x/mod zip helper
+        run: |
+          set -euxo pipefail
+          HELPER="$(mktemp -d)"
+          cp .github/create_mod.go "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/createmod
+          GOFLAGS= go get golang.org/x/mod@v0.24.0
+          GOFLAGS= go build -o "$RUNNER_TEMP/create_mod" .
+      - name: Stage module tree
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/zipsrc" "$RUNNER_TEMP/out"
+          tar -c --exclude=.git --exclude=.github -C "$GITHUB_WORKSPACE" . | tar -x -C "$RUNNER_TEMP/zipsrc"
+          test ! -e "$RUNNER_TEMP/zipsrc/.github"
+          test -f "$RUNNER_TEMP/zipsrc/go.mod"
+          test -f "$RUNNER_TEMP/zipsrc/.gitignore"
+          test -f "$RUNNER_TEMP/zipsrc/.gitattributes"
+      - name: Create module zip
+        run: |
+          set -euxo pipefail
+          "$RUNNER_TEMP/create_mod" "$MODULE_PATH" "$MODULE_VERSION" "$RUNNER_TEMP/zipsrc" "$RUNNER_TEMP/out/$MODULE_VERSION.zip"
+          N=$(unzip -Z1 "$RUNNER_TEMP/out/$MODULE_VERSION.zip" | wc -l)
+          echo "zip entries: $N"
+          # 1568 = entry count of the public proxy.golang.org zip
+          test "$N" -eq 1568
+          sha256sum "$RUNNER_TEMP/out/$MODULE_VERSION.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.0.0-20210106214847-113979e3529a.zip
+          if-no-files-found: error
+
+  test:
+    name: "test (${{ matrix.os }}, go ${{ matrix.go }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            go: "1.14"
+          - os: windows-latest
+            go: "1.14"
+            # internal/span TestURIFromPath expects rooted paths to resolve
+            # onto drive C:, but the runner workspace is on D:.
+            workdir: 'C:\xtools'
+          # Go 1.16 defaults to -mod=readonly, which this snapshot's
+          # packagestest Modules exporter predates; Go 1.15 has no
+          # darwin/arm64 build, so it runs as x64 under Rosetta.
+          - os: macos-14
+            go: "1.15"
+            arch: x64
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ matrix.workdir || github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Relocate checkout to drive C
+        if: runner.os == 'Windows'
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euxo pipefail
+          cp -r . /c/xtools
+          ls /c/xtools/go.mod
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          architecture: ${{ matrix.arch }}
+      - name: Set up MSYS2 MinGW64 gcc
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+      - name: Use MinGW64 gcc and runner temp dir
+        if: runner.os == 'Windows'
+        run: |
+          set -euxo pipefail
+          # Go 1.14's prebuilt runtime/cgo needs an msvcrt gcc; the runner's
+          # default mingw is UCRT.
+          echo '${{ steps.msys2.outputs.msys2-location }}\mingw64\bin' >> "$GITHUB_PATH"
+          echo 'TEMP=${{ runner.temp }}' >> "$GITHUB_ENV"
+          echo 'TMP=${{ runner.temp }}' >> "$GITHUB_ENV"
+      - name: Show gcc
+        if: runner.os == 'Windows'
+        run: |
+          set -euxo pipefail
+          which gcc
+          gcc --version
+      - name: macOS cgo DWARF and GNU diff
+        if: runner.os == 'macOS'
+        run: |
+          set -euxo pipefail
+          # clang >= 15 (every Xcode on this runner) emits nameless
+          # DW_TAG_variable entries that cgo before Go 1.18.10 rejects
+          # ("malformed DWARF TagVariable entry", golang/go#53000), so cgo
+          # uses the LLVM 14.0.0 x86_64 release, which predates that change.
+          curl -fsSL -o "$RUNNER_TEMP/llvm.tar.xz" https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.0/clang+llvm-14.0.0-x86_64-apple-darwin.tar.xz
+          mkdir -p "$RUNNER_TEMP/llvm14"
+          tar -xJf "$RUNNER_TEMP/llvm.tar.xz" -C "$RUNNER_TEMP/llvm14" --strip-components=1
+          "$RUNNER_TEMP/llvm14/bin/clang" --version
+          echo "CC=$RUNNER_TEMP/llvm14/bin/clang" >> "$GITHUB_ENV"
+          echo "CXX=$RUNNER_TEMP/llvm14/bin/clang++" >> "$GITHUB_ENV"
+          # LLVM 14 cannot parse the runner's macOS 14 SDK headers (Go's own
+          # crypto/x509 cgo fails), so pair it with the contemporary 11.3 SDK.
+          curl -fsSL -o "$RUNNER_TEMP/sdk.tar.xz" https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz
+          mkdir -p "$RUNNER_TEMP/sdk"
+          tar -xJf "$RUNNER_TEMP/sdk.tar.xz" -C "$RUNNER_TEMP/sdk"
+          test -f "$RUNNER_TEMP/sdk/MacOSX11.3.sdk/SDKSettings.json"
+          echo "SDKROOT=$RUNNER_TEMP/sdk/MacOSX11.3.sdk" >> "$GITHUB_ENV"
+          # internal/testenv requires GNU diff (BSD diff lacks -version).
+          brew install diffutils
+          echo "$(brew --prefix diffutils)/bin" >> "$GITHUB_PATH"
+      - name: Go env
+        run: |
+          go version
+          go env
+      - name: Regenerate godoc/static/static.go
+        run: |
+          set -euxo pipefail
+          go generate ./godoc/static
+      - name: Build
+        run: |
+          set -euxo pipefail
+          go build ./...
+      - name: Test
+        run: |
+          set -euxo pipefail
+          go test -v ${{ inputs.test-filter || './...' }} 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+      - name: Test summary
+        if: always()
+        run: |
+          # byte-oriented: the -v log carries raw invalid-UTF-8 test strings
+          # that macOS BSD awk aborts on in a UTF-8 locale.
+          LC_ALL=C awk '
+            /^ok /                 { pok++ }
+            /^FAIL[ \t]+[^ \t]/    { pf++ }
+            /^\?/                  { pnt++ }
+            /^ *--- PASS/          { tp++ }
+            /^ *--- FAIL/          { tf++ }
+            /^ *--- SKIP/          { ts++ }
+            END {
+              printf "TEST SUMMARY: packages ok=%d failed=%d no-test-files=%d; tests passed=%d failed=%d skipped=%d\n", pok, pf, pnt, tp, tf, ts
+              exit (pf + tf > 0)
+            }
+          ' "$RUNNER_TEMP/go-test.log"
